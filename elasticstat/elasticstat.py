@@ -24,6 +24,7 @@ import time
 import json
 import re
 
+from ssl import create_default_context
 from packaging import version
 from elasticsearch import Elasticsearch
 from urllib3.util import parse_url
@@ -115,41 +116,27 @@ class Elasticstat:
             self.cluster_categories.remove('tasks')
 
         # Create Elasticsearch client
-        self.es_client = Elasticsearch(self._parse_connection_properties(args.hostlist, args.port, args.username,
-                                                                         args.password, args.use_ssl))
+        # self.es_client = Elasticsearch(self._parse_connection_properties(args.hostlist, int(args.port), args.username,
+        # args.password))
+        headers = {
+            'connection': 'keep-alive',
+            'redirects': True
+        }
+        ssl_context = create_default_context(cafile="/Users/ply5528/usaa_cert_chain.cert",
+                                     capath=None,
+                                     cadata=None)
+
+        self.es_client = Elasticsearch(
+            args.hostlist,
+            api_key="",
+            headers=headers,
+            request_timeout=30,
+            ssl_context=ssl_context
+        )
+        # print(self.es_client.info())
+        # exit()
         # moving threadpool after client creation to use version discovery
         self.threadpools = self._parse_threadpools(args.threadpools)
-
-    def _parse_connection_properties(self, host, port, username, password, use_ssl):
-        hosts_list = []
-
-        if isinstance(host, str):
-            # Force to a list, split on ',' if multiple
-            host = host.split(',')
-
-        for entity in host:
-            # Loop over the hosts and parse connection properties
-            host_properties = {}
-
-            parsed_uri = parse_url(entity)
-            host_properties['host'] = parsed_uri.host
-            if parsed_uri.port is not None:
-                host_properties['port'] = parsed_uri.port
-            else:
-                host_properties['port'] = port
-
-            if parsed_uri.scheme == 'https' or use_ssl is True:
-                host_properties['use_ssl'] = True
-
-            if parsed_uri.auth is not None:
-                host_properties['http_auth'] = parsed_uri.auth
-            elif username is not None:
-                if password is None or password == 'PROMPT':
-                    password = getpass.getpass()
-                host_properties['http_auth'] = (username, password)
-
-            hosts_list.append(host_properties)
-        return hosts_list
 
     def _parse_categories(self, categories):
         if isinstance(categories, list):
@@ -169,10 +156,10 @@ class Elasticstat:
     def _parse_threadpools(self, threadpools):
         # adding version discovery for ES7 to get correct threadpool
         if version.parse(json.dumps(self.es_client.info()['version']['number']).strip('"')) > version.parse("7.0.0"):
-            threadpools = filter(None, [re.sub(r".*index*", r"", i) for i in threadpools])
-            threadpools = filter(None, [re.sub(r".*bulk*", r"", i) for i in threadpools])
+            threadpools = [_f for _f in [re.sub(r".*index*", r"", i) for i in threadpools] if _f]
+            threadpools = [_f for _f in [re.sub(r".*bulk*", r"", i) for i in threadpools] if _f]
         else:
-            threadpools = filter(None, [re.sub(r".*write*", r"", i) for i in threadpools])
+            threadpools = [_f for _f in [re.sub(r".*write*", r"", i) for i in threadpools] if _f]
         # end vesion discovery
         if isinstance(threadpools, list) and ',' in threadpools[0]:
             threadpools = threadpools[0].split(',')
@@ -212,13 +199,14 @@ class Elasticstat:
         try:
             # Section to handle ES 5
             role = node_stats['nodes'][node_id]['roles']
-            if 'data' in role:
-                return "DATA"
+            if 'data' in role[0]:
+                return role[0]
             if 'master' in role:
-                return "MST"
+                return "MSTR"
             if 'ingest' in role:
-                return "ING"
+                return "INGST"
             else:
+                print(role)
                 return "UNK"
         except KeyError:
             # Section to handle ES < 2.x
@@ -249,7 +237,8 @@ class Elasticstat:
             if 'ingest' in role:
                 return "ING"
             else:
-                return "UNK"
+                return role
+                # return "UNK"
 
     def get_gc_stats(self, node_id, node_gc_stats):
         # check if this is a new node
@@ -314,7 +303,7 @@ class Elasticstat:
         if 'cpu' in node['os'] and 'load_average' in node['os']['cpu']:
             # Elasticsearch 5.x+ move load average to cpu key
             node_load_avgs = []
-            for load_avg in node['os']['cpu']['load_average'].values():
+            for load_avg in list(node['os']['cpu']['load_average'].values()):
                 node_load_avgs.append(load_avg)
             node_load_avg = "/".join("{0:.2f}".format(x) for x in node_load_avgs)
         else:
@@ -363,7 +352,7 @@ class Elasticstat:
     def process_node_connections(self, role, node_id, node):
         processed_node_conns = {}
         if node.get('http') is None:
-            node['http'] = {u'total_opened': 0, u'current_open': 0}
+            node['http'] = {'total_opened': 0, 'current_open': 0}
         processed_node_conns['http_conn'] = self.get_http_conns(node_id, node['http'])
         processed_node_conns['transport_conn'] = node['transport']['server_open']
         return(NODES_TEMPLATE['connections'].format(**processed_node_conns))
@@ -413,7 +402,7 @@ class Elasticstat:
                     failed_node = {}
                     failed_node['name'] = failed_node_name + '-'
                     failed_node['role'] = "({0})".format(role)  # Role it had when we last saw this node in the cluster
-                    print self.colorize(NODES_FAILED_TEMPLATE.format(**failed_node), ESColors.GRAY)
+                    print(self.colorize(NODES_FAILED_TEMPLATE.format(**failed_node), ESColors.GRAY))
                 continue
             # make sure node's role hasn't changed
             current_role = self.get_role(node_id, nodes_stats)
@@ -423,9 +412,9 @@ class Elasticstat:
                 self.nodes_by_role[role].remove(node_id)  # remove from current role
             row = self.process_node(current_role, node_id, nodes_stats['nodes'][node_id])
             if node_id in self.new_nodes:
-                print self.colorize(row, ESColors.WHITE)
+                print(self.colorize(row, ESColors.WHITE))
             else:
-                print row
+                print(row)
 
     def get_threads_headings(self):
         thread_segments = []
@@ -455,7 +444,7 @@ class Elasticstat:
         # just run forever until ctrl-c
         while True:
             cluster_segments = []
-            cluster_health = self.es_client.cluster.health()
+            cluster_health = dict(self.es_client.cluster.health())
             nodes_stats = self.es_client.nodes.stats(human=True)
             self.active_master = self.es_client.cat.master(h="id").strip()  # needed to remove trailing newline
 
@@ -465,8 +454,8 @@ class Elasticstat:
             for category in self.cluster_categories:
                 cluster_segments.append(CLUSTER_TEMPLATE[category].format(**cluster_health))
                 cluster_health_formatted = "   ".join(cluster_segments)
-            print self.colorize(self.cluster_headings, ESColors.GRAY)
-            print self.colorize(cluster_health_formatted, self.STATUS_COLOR[status])
+            print(self.colorize(self.cluster_headings, ESColors.GRAY))
+            print(self.colorize(cluster_health_formatted, self.STATUS_COLOR[status]))
 
             # Nodes can join and leave cluster with each iteration -- in order to report on nodes
             # that have left the cluster, maintain a list grouped by role.
@@ -490,10 +479,10 @@ class Elasticstat:
                         self.nodes_by_role.setdefault(node_role, []).append(node_id)
 
             # Print node stats
-            print self.colorize(self.node_headings, ESColors.GRAY)
+            print(self.colorize(self.node_headings, ESColors.GRAY))
             for role in self.nodes_by_role:
                 self.process_role(role, nodes_stats)
-            print ""  # space out each run for readability
+            print("")  # space out each run for readability
             time.sleep(self.sleep_interval)
 
 
@@ -553,7 +542,7 @@ def main():
                         default=False,
                         help='Disable display of pending tasks in cluster health (use for Elasticsearch <v1.5)')
     parser.add_argument('delay_interval',
-                        default='1',
+                        default='5',
                         nargs='?',
                         type=int,
                         metavar='DELAYINTERVAL',
